@@ -1,4 +1,4 @@
-from multiprocessing import Pool
+from multiprocessing import Pool, get_context, set_start_method
 import math, random, sys
 import pickle
 import argparse
@@ -34,6 +34,19 @@ def tensorize_cond(mol_batch, vocab):
     return to_numpy(x)[:-1] + to_numpy(y) + (cond,) #no need of order for x
 
 if __name__ == "__main__":
+    # Safer multiprocessing start (reduces copy-on-write explosions with RDKit/MKL)
+    try:
+        set_start_method("spawn")
+    except RuntimeError:
+        pass
+
+    # Stop NumPy/MKL/BLAS from spawning extra threads inside workers
+    import os
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    torch.set_num_threads(1)
+
     lg = rdkit.RDLogger.logger() 
     lg.setLevel(rdkit.RDLogger.CRITICAL)
 
@@ -49,7 +62,8 @@ if __name__ == "__main__":
         vocab = [x.strip("\r\n ").split() for x in f]
     args.vocab = PairVocab(vocab, cuda=False)
 
-    pool = Pool(args.ncpu) 
+    # Limit worker lifetime to avoid gradual RAM creep
+    pool = get_context("spawn").Pool(processes=args.ncpu, maxtasksperchild=100)
     random.seed(1)
 
     if args.mode == 'pair':
@@ -61,17 +75,18 @@ if __name__ == "__main__":
 
         batches = [data[i : i + args.batch_size] for i in range(0, len(data), args.batch_size)]
         func = partial(tensorize_pair, vocab = args.vocab)
-        all_data = pool.map(func, batches)
-        num_splits = max(len(all_data) // 1000, 1)
-
-        le = (len(all_data) + num_splits - 1) // num_splits
-
-        for split_id in range(num_splits):
-            st = split_id * le
-            sub_data = all_data[st : st + le]
-
-            with open('tensors-%d.pkl' % split_id, 'wb') as f:
-                pickle.dump(sub_data, f, pickle.HIGHEST_PROTOCOL)
+        # Stream to disk to avoid holding everything in RAM
+        shard_size = 1000  # number of batches per shard
+        shard, shard_id = [], 0
+        for i, out in enumerate(pool.imap_unordered(func, batches, chunksize=4)):
+            shard.append(out)
+            if len(shard) >= shard_size:
+                with open(f'tensors-{shard_id}.pkl', 'wb') as f:
+                    pickle.dump(shard, f, pickle.HIGHEST_PROTOCOL)
+                shard, shard_id = [], shard_id + 1
+        if shard:
+            with open(f'tensors-{shard_id}.pkl', 'wb') as f:
+                pickle.dump(shard, f, pickle.HIGHEST_PROTOCOL)
 
     elif args.mode == 'cond_pair':
         #dataset contains molecule pairs with conditions
@@ -82,17 +97,17 @@ if __name__ == "__main__":
 
         batches = [data[i : i + args.batch_size] for i in range(0, len(data), args.batch_size)]
         func = partial(tensorize_cond, vocab = args.vocab)
-        all_data = pool.map(func, batches)
-        num_splits = max(len(all_data) // 1000, 1)
-
-        le = (len(all_data) + num_splits - 1) // num_splits
-
-        for split_id in range(num_splits):
-            st = split_id * le
-            sub_data = all_data[st : st + le]
-
-            with open('tensors-%d.pkl' % split_id, 'wb') as f:
-                pickle.dump(sub_data, f, pickle.HIGHEST_PROTOCOL)
+        shard_size = 1000
+        shard, shard_id = [], 0
+        for i, out in enumerate(pool.imap_unordered(func, batches, chunksize=4)):
+            shard.append(out)
+            if len(shard) >= shard_size:
+                with open(f'tensors-{shard_id}.pkl', 'wb') as f:
+                    pickle.dump(shard, f, pickle.HIGHEST_PROTOCOL)
+                shard, shard_id = [], shard_id + 1
+        if shard:
+            with open(f'tensors-{shard_id}.pkl', 'wb') as f:
+                pickle.dump(shard, f, pickle.HIGHEST_PROTOCOL)
 
     elif args.mode == 'single':
         #dataset contains single molecules
@@ -103,15 +118,18 @@ if __name__ == "__main__":
 
         batches = [data[i : i + args.batch_size] for i in range(0, len(data), args.batch_size)]
         func = partial(tensorize, vocab = args.vocab)
-        all_data = pool.map(func, batches)
-        num_splits = len(all_data) // 1000
+        # Fix zero-splits bug + stream writing
+        shard_size = 1000
+        shard, shard_id = [], 0
+        for i, out in enumerate(pool.imap_unordered(func, batches, chunksize=4)):
+            shard.append(out)
+            if len(shard) >= shard_size:
+                with open(f'tensors-{shard_id}.pkl', 'wb') as f:
+                    pickle.dump(shard, f, pickle.HIGHEST_PROTOCOL)
+                shard, shard_id = [], shard_id + 1
+        if shard:
+            with open(f'tensors-{shard_id}.pkl', 'wb') as f:
+                pickle.dump(shard, f, pickle.HIGHEST_PROTOCOL)
 
-        le = (len(all_data) + num_splits - 1) // num_splits
-
-        for split_id in range(num_splits):
-            st = split_id * le
-            sub_data = all_data[st : st + le]
-
-            with open('tensors-%d.pkl' % split_id, 'wb') as f:
-                pickle.dump(sub_data, f, pickle.HIGHEST_PROTOCOL)
-
+    pool.close()
+    pool.join()
