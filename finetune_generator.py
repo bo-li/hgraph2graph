@@ -25,6 +25,16 @@ param_norm = lambda m: math.sqrt(sum([p.norm().item() ** 2 for p in m.parameters
 grad_norm = lambda m: math.sqrt(sum([p.grad.norm().item() ** 2 for p in m.parameters() if p.grad is not None]))
 
 
+def safe_to_numpy(x):
+    """Tensor -> numpy; ndarray -> itself; scalar -> scalar; others -> unchanged."""
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    if isinstance(x, (np.ndarray, np.generic)):
+        return np.array(x)
+    if isinstance(x, (int, float)):
+        return x
+    return x
+
 class Chemprop(object):
     
     def __init__(self, checkpoint_dir):
@@ -149,7 +159,9 @@ if __name__ == "__main__":
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), args.clip_norm)
                 optimizer.step()
-                meters = meters + np.array([kl_div, loss.item(), wacc * 100, iacc * 100, tacc * 100, sacc * 100])
+                meters = meters + np.array([kl_div, loss.item(), \
+                        safe_to_numpy(wacc) * 100, safe_to_numpy(iacc) * 100, \
+                        safe_to_numpy(tacc) * 100, safe_to_numpy(sacc) * 100])
 
             meters /= len(dataset)
             print("Beta: %.3f, KL: %.2f, loss: %.3f, Word: %.2f, %.2f, Topo: %.2f, Assm: %.2f, PNorm: %.2f, GNorm: %.2f" % (beta, meters[0], meters[1], meters[2], meters[3], meters[4], meters[5], param_norm(model), grad_norm(model)))
