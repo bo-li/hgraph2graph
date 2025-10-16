@@ -18,9 +18,11 @@ from tqdm import tqdm
 lg = rdkit.RDLogger.logger()
 lg.setLevel(rdkit.RDLogger.CRITICAL)
 
-def process_smiles_batch(smiles_batch):
+def process_smiles_batch(smiles_batch, skip_invalid=False):
     """Process a batch of SMILES strings."""
     vocab = set()
+    bad_smiles = []
+
     for smiles in smiles_batch:
         try:
             hmol = MolGraph(smiles)
@@ -29,14 +31,24 @@ def process_smiles_batch(smiles_batch):
                 vocab.add(attr['label'])
                 for i, s in attr['inter_label']:
                     vocab.add((smiles_node, s))
-        except Exception:
-            pass
-    return vocab
+        except Exception as e:
+            if skip_invalid:
+                bad_smiles.append(smiles[:100] if len(smiles) > 100 else smiles)
+            else:
+                # Re-raise with more information
+                raise RuntimeError(
+                    f"Failed to process SMILES: {smiles[:100]}\n"
+                    f"Error: {type(e).__name__}: {str(e)[:200]}\n"
+                    f"Hint: Use --skip_invalid flag to skip invalid molecules and continue processing."
+                )
 
-def process_file_streaming(filepath, chunk_size, ncpu):
+    return vocab, bad_smiles
+
+def process_file_streaming(filepath, chunk_size, ncpu, skip_invalid=False):
     """Process a file in streaming fashion with better progress tracking."""
     pool = Pool(ncpu)
     global_vocab = set()
+    all_bad_smiles = []
 
     # Read all lines and create batches
     batches = []
@@ -60,16 +72,18 @@ def process_file_streaming(filepath, chunk_size, ncpu):
     pbar = tqdm(total=len(batches), desc=f"  {filepath.split('/')[-1]}",
                 unit=" batch", position=1, leave=False)
 
-    for vocab in pool.imap_unordered(process_smiles_batch, batches):
+    func = partial(process_smiles_batch, skip_invalid=skip_invalid)
+    for vocab, bad_smiles in pool.imap_unordered(func, batches):
         global_vocab.update(vocab)
+        all_bad_smiles.extend(bad_smiles)
         pbar.update(1)
-        pbar.set_postfix({"vocab": len(global_vocab)})
+        pbar.set_postfix({"vocab": len(global_vocab), "skipped": len(all_bad_smiles)})
 
     pbar.close()
     pool.close()
     pool.join()
 
-    return global_vocab
+    return global_vocab, all_bad_smiles
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -83,6 +97,8 @@ if __name__ == "__main__":
                         help='Number of molecules per chunk (smaller = more updates)')
     parser.add_argument('--output', type=str, default='vocab.txt',
                         help='Output vocabulary file')
+    parser.add_argument('--skip_invalid', action='store_true',
+                        help='Skip invalid molecules instead of crashing (logs skipped molecules)')
     args = parser.parse_args()
 
     # Find all input files
@@ -95,9 +111,11 @@ if __name__ == "__main__":
 
     print(f"Found {len(input_files)} files to process", file=sys.stderr)
     print(f"Using {args.ncpu} CPU cores with chunk size {args.chunk_size:,}", file=sys.stderr)
+    print(f"Skip invalid:      {args.skip_invalid}", file=sys.stderr)
 
     # Process files in streaming fashion
     global_vocab = set()
+    all_skipped = []
 
     # Progress bar for files
     file_pbar = tqdm(input_files, desc="Files", unit="file", position=0)
@@ -107,15 +125,33 @@ if __name__ == "__main__":
         file_pbar.set_description(f"File: {filename}")
 
         # Process file
-        file_vocab = process_file_streaming(filepath, args.chunk_size, args.ncpu)
+        file_vocab, file_skipped = process_file_streaming(filepath, args.chunk_size, args.ncpu, args.skip_invalid)
         global_vocab.update(file_vocab)
+        all_skipped.extend(file_skipped)
 
-        file_pbar.set_postfix({"total_vocab": f"{len(global_vocab):,}"})
+        file_pbar.set_postfix({
+            "total_vocab": f"{len(global_vocab):,}",
+            "skipped": len(all_skipped)
+        })
 
     file_pbar.close()
 
     # Sort and write output
     print(f"\nFinal vocabulary size: {len(global_vocab):,}", file=sys.stderr)
+
+    # Report skipped molecules if any
+    if all_skipped:
+        print(f"\n{'='*80}", file=sys.stderr)
+        print(f"SKIPPED MOLECULES", file=sys.stderr)
+        print(f"{'='*80}", file=sys.stderr)
+        print(f"Total skipped: {len(all_skipped):,}", file=sys.stderr)
+        print(f"\nFirst 10 skipped SMILES:", file=sys.stderr)
+        for i, smi in enumerate(all_skipped[:10], 1):
+            print(f"  {i}. {smi}", file=sys.stderr)
+        if len(all_skipped) > 10:
+            print(f"  ... and {len(all_skipped) - 10} more", file=sys.stderr)
+        print(f"{'='*80}\n", file=sys.stderr)
+
     print(f"Writing to {args.output}...", file=sys.stderr)
 
     sorted_vocab = sorted(global_vocab)
