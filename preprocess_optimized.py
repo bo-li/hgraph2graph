@@ -21,9 +21,42 @@ def to_numpy(tensors):
     b = [convert(x) for x in b[0]], [convert(x) for x in b[1]]
     return a, b, c
 
-def tensorize(mol_batch, vocab):
-    x = MolGraph.tensorize(mol_batch, vocab, common_atom_vocab)
-    return to_numpy(x)
+def tensorize(mol_batch, vocab, skip_invalid=False):
+    try:
+        x = MolGraph.tensorize(mol_batch, vocab, common_atom_vocab)
+        return to_numpy(x), []
+    except Exception as e:
+        # Convert unpicklable Boost.Python exceptions to picklable RuntimeError
+        # Test each molecule individually to find the problematic one
+        import sys
+        print(f"\n{'='*80}", file=sys.stderr)
+        print(f"ERROR IN BATCH: {type(e).__name__}: {str(e)[:200]}", file=sys.stderr)
+        print(f"Testing {len(mol_batch)} molecules individually...", file=sys.stderr)
+
+        good_mols = []
+        bad_mols = []
+        for i, mol in enumerate(mol_batch):
+            try:
+                MolGraph.tensorize([mol], vocab, common_atom_vocab)
+                good_mols.append(mol)
+            except:
+                bad_mols.append(mol[:100] if len(mol) > 100 else mol)
+                print(f"  Molecule {i}: FAIL - {mol[:100]}", file=sys.stderr)
+
+        print(f"{'='*80}\n", file=sys.stderr)
+
+        if skip_invalid and good_mols:
+            # Return tensorized good molecules and list of bad ones
+            print(f"SKIPPING {len(bad_mols)} invalid molecules, processing {len(good_mols)} valid ones", file=sys.stderr)
+            x = MolGraph.tensorize(good_mols, vocab, common_atom_vocab)
+            return to_numpy(x), bad_mols
+
+        # Original behavior: raise error
+        error_msg = f"Tensorization failed. Found {len(bad_mols)} bad molecules out of {len(mol_batch)}.\n"
+        if bad_mols:
+            error_msg += f"Bad molecules: {bad_mols[:3]}\n"
+        error_msg += f"Original error: {type(e).__name__}: {str(e)[:200]}"
+        raise RuntimeError(error_msg)
 
 def tensorize_pair(mol_batch, vocab):
     x, y = zip(*mol_batch)
@@ -80,6 +113,8 @@ if __name__ == "__main__":
                         help='Resume from last checkpoint (skips already processed shards)')
     parser.add_argument('--checkpoint_file', type=str, default='.preprocess_checkpoint.txt',
                         help='Checkpoint file to track progress (default: .preprocess_checkpoint.txt)')
+    parser.add_argument('--skip_invalid', action='store_true',
+                        help='Skip invalid molecules instead of crashing (logs skipped molecules)')
     args = parser.parse_args()
 
     print("="*80)
@@ -95,6 +130,7 @@ if __name__ == "__main__":
     print(f"Max tasks/child:   {args.maxtasksperchild}")
     print(f"Shuffle:           {not args.no_shuffle}")
     print(f"Resume mode:       {args.resume}")
+    print(f"Skip invalid:      {args.skip_invalid}")
     if args.resume:
         print(f"Checkpoint file:   {args.checkpoint_file}")
     print("="*80)
@@ -158,7 +194,7 @@ if __name__ == "__main__":
             random.shuffle(data)
 
         batches = [data[i : i + args.batch_size] for i in range(0, len(data), args.batch_size)]
-        func = partial(tensorize, vocab = args.vocab)
+        func = partial(tensorize, vocab = args.vocab, skip_invalid = args.skip_invalid)
 
     print(f"Created {len(batches):,} batches")
     print(f"Expected output: ~{len(batches) // args.shard_size + 1} shard files")
@@ -191,20 +227,30 @@ if __name__ == "__main__":
     print("\nProcessing batches...")
     shard, shard_start_batch = [], start_batch
     molecules_processed = start_batch * args.batch_size
+    all_skipped = []  # Track all skipped molecules
 
     # Use imap_unordered with optimized chunksize
     pbar = tqdm(total=len(batches), desc="Processing", unit=" batch")
 
     try:
-        for i, out in enumerate(pool.imap_unordered(func, batches, chunksize=args.chunksize)):
+        for i, result in enumerate(pool.imap_unordered(func, batches, chunksize=args.chunksize)):
+            current_batch = start_batch + i
+
+            # Unpack result based on mode
+            if args.mode == 'single':
+                out, skipped = result
+                all_skipped.extend(skipped)
+            else:
+                out = result
+
             shard.append(out)
             molecules_processed += args.batch_size
-            current_batch = start_batch + i
             pbar.update(1)
             pbar.set_postfix({
                 "molecules": f"{molecules_processed:,}",
                 "shard": shard_id,
-                "files": shard_id + 1
+                "files": shard_id + 1,
+                "skipped": len(all_skipped) if args.skip_invalid else 0
             })
 
             # Write shard to disk when full
@@ -267,6 +313,13 @@ if __name__ == "__main__":
     print(f"Total molecules:   {molecules_processed:,}")
     print(f"Total batches:     {start_batch + len(batches):,}")
     print(f"Output files:      {shard_id + 1}")
+    if args.skip_invalid and all_skipped:
+        print(f"Skipped molecules: {len(all_skipped):,} ({len(all_skipped)/molecules_processed*100:.4f}%)")
+        print(f"\nFirst 10 skipped SMILES:")
+        for i, smi in enumerate(all_skipped[:10]):
+            print(f"  {i+1}. {smi}")
+        if len(all_skipped) > 10:
+            print(f"  ... and {len(all_skipped) - 10} more")
     print(f"Files pattern:     {args.output_prefix}-*.pkl")
     print(f"Checkpoint:        Removed (processing complete)")
     print("="*80)
