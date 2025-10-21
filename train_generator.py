@@ -54,6 +54,13 @@ print(args)
 torch.manual_seed(args.seed)
 random.seed(args.seed)
 
+# CUDA seeding for reproducibility
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)  # For multi-GPU
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 vocab = [x.strip("\r\n ").split() for x in open(args.vocab)] 
 args.vocab = PairVocab(vocab)
 
