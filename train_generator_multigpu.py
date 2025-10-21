@@ -126,6 +126,8 @@ random.seed(args.seed)
 np.random.seed(args.seed)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 # Initialize Weights & Biases
 use_wandb = args.wandb and WANDB_AVAILABLE
